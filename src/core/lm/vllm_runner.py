@@ -1,4 +1,3 @@
-# src/core/lm/vllm_runner.py
 from __future__ import annotations
 
 from typing import Optional
@@ -10,6 +9,7 @@ class VLLMRunner:
     """
     真实 vLLM 推理 runner
     """
+
     def __init__(
         self,
         model_ckpt: str,
@@ -60,10 +60,12 @@ class VLLMRunner:
         out0 = req0.outputs[0]
 
         num_cached = getattr(req0, "num_cached_tokens", 0)
+        out_token_ids = list(getattr(out0, "token_ids", []) or [])
 
         return LMResult(
             output_text=out0.text,
-            output_tokens_len=len(out0.token_ids),
+            output_tokens_len=len(out_token_ids),
             num_cached_tokens=int(num_cached) if num_cached is not None else 0,
             prompt_tokens_len=len(self.tokenizer.encode(prompt_text)) if self.tokenizer is not None else None,
+            output_token_ids=out_token_ids,
         )

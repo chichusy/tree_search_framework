@@ -1,8 +1,7 @@
-# src/core/trace/schema.py
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, asdict, field
+from typing import Any, Dict, Optional, List
 
 
 @dataclass
@@ -12,14 +11,14 @@ class CallRecord:
     rollout_id: int
     node_id: int
     parent_node_id: Optional[int]
-    purpose: str  # "expand" | "simulate" | "select" | "reward" | "final" | "prm"
+    purpose: str  # "expand" | "simulate" | "select" | "reward_model" | "rollout_summary" | "final"
 
     # token-level prompt/decoding sizes
-    input_len: int = 0          # prompt token length (prefill length)
-    output_len: int = 0         # generated tokens length (decode length)
+    input_len: int = 0
+    output_len: int = 0
 
     # lightweight identity for prompt tokens
-    input_ids_digest: str = ""  # sha1 digest of input_ids
+    input_ids_digest: str = ""
 
     # locality vs LAST call (time locality)
     lcp_last: int = 0
@@ -38,9 +37,74 @@ class CallRecord:
     # Extra info (keep flexible)
     meta: Optional[Dict[str, Any]] = None
 
-    # Optional: save raw texts for debugging (can be large)
+    # Optional: save raw texts for debugging
     prompt_text: Optional[str] = None
     output_text: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class SequenceRecord:
+    call_id: int
+    rollout_id: int
+    node_id: int
+    parent_node_id: Optional[int]
+    purpose: str
+
+    prompt_token_ids: List[int] = field(default_factory=list)
+    output_token_ids: List[int] = field(default_factory=list)
+    full_token_ids: List[int] = field(default_factory=list)
+    delta_token_ids_vs_parent: List[int] = field(default_factory=list)
+
+    prompt_len: int = 0
+    output_len: int = 0
+    full_len: int = 0
+    delta_len: int = 0
+
+    prompt_ids_digest: str = ""
+    output_ids_digest: str = ""
+    full_ids_digest: str = ""
+    delta_ids_digest: str = ""
+
+    lcp_full_parent: int = 0
+
+    meta: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class LogicalBlock:
+    block_index: int
+    start_token_idx: int
+    end_token_idx: int   # exclusive
+    num_tokens: int
+    block_id: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class BlockTraceRecord:
+    call_id: int
+    rollout_id: int
+    node_id: int
+    parent_node_id: Optional[int]
+    purpose: str
+    block_size: int
+
+    prompt_blocks: List[LogicalBlock] = field(default_factory=list)
+    output_blocks: List[LogicalBlock] = field(default_factory=list)
+    full_blocks: List[LogicalBlock] = field(default_factory=list)
+    delta_blocks_vs_parent: List[LogicalBlock] = field(default_factory=list)
+
+    lcp_full_parent: int = 0
+
+    meta: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from src.core.dataset import load_dataset, extract_question
@@ -32,28 +33,31 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--top_p", type=float, default=0.95)
 
+    # trace controls
+    ap.add_argument("--disable_sequence_trace", action="store_true")
+    ap.add_argument("--disable_block_trace", action="store_true")
+    ap.add_argument("--logical_block_size", type=int, default=16)
+
     # reward mode
     ap.add_argument("--reward_mode", type=str, default="none", choices=["none", "orm", "prm"])
 
-    # ---- ORM (Outcome Reward Model / terminal verifier) ----
+    # ---- ORM ----
     ap.add_argument(
         "--orm_type",
         type=str,
         default="orm_yesno",
         choices=["orm_yesno", "orm_rule_gsm8k"],
-        help="When reward_mode=orm: choose LLM yes/no judge or GSM8K GT rule judge.",
     )
     ap.add_argument("--orm_max_tokens", type=int, default=4)
     ap.add_argument("--orm_temperature", type=float, default=0.0)
     ap.add_argument("--orm_top_p", type=float, default=1.0)
 
-    # ---- PRM (Process Reward Model / step-wise scoring) ----
+    # ---- PRM ----
     ap.add_argument(
         "--prm_type",
         type=str,
         default="prm_stepwise",
         choices=["prm_stepwise"],
-        help="When reward_mode=prm: step-wise PRM scorer.",
     )
     ap.add_argument("--prm_step_max_tokens", type=int, default=8)
     ap.add_argument("--prm_step_temperature", type=float, default=0.0)
@@ -63,7 +67,6 @@ def main():
         type=str,
         default="mean",
         choices=["mean", "min", "prod", "last", "terminal"],
-        help="How to aggregate step scores into a rollout reward.",
     )
 
     # ---- terminal mode ----
@@ -72,27 +75,10 @@ def main():
         type=str,
         default="answer_or_depth",
         choices=["depth", "answer", "answer_or_depth", "custom_regex_or_depth"],
-        help="Terminal condition: depth only / answer only / answer or depth / custom regex or depth.",
     )
-    ap.add_argument(
-        "--max_prefix_tokens",
-        type=int,
-        default=0,
-        help="Optional prefix token limit. 0 means disabled.",
-    )
-    ap.add_argument(
-        "--dataset_name",
-        type=str,
-        default="gsm8k",
-        help="Used by terminal factory to select preset answer regex patterns.",
-    )
-    ap.add_argument(
-        "--custom_regex",
-        type=str,
-        nargs="*",
-        default=[],
-        help="Optional custom regex patterns used only when terminal_mode=custom_regex_or_depth.",
-    )
+    ap.add_argument("--max_prefix_tokens", type=int, default=0)
+    ap.add_argument("--dataset_name", type=str, default="gsm8k")
+    ap.add_argument("--custom_regex", type=str, nargs="*", default=[])
 
     ap.add_argument("--save_prompt_text", action="store_true")
     ap.add_argument("--save_output_text", action="store_true")
@@ -103,7 +89,6 @@ def main():
 
     samples = load_dataset(args.dataset_path, args.dataset_format)[: args.max_samples]
 
-    # build policy runner
     if args.runner == "dummy":
         lm = DummyLMRunner(fixed_output_tokens=min(64, args.max_new_tokens))
         tokenizer = None
@@ -123,14 +108,58 @@ def main():
 
     for i, sample in enumerate(samples):
         q = extract_question(sample)
-        sample_id = f"{i:05d}"
-        sample_dir = out_dir / "samples" / sample_id
+
+        # -----------------------------
+        # NEW: dataset-level sample info
+        # -----------------------------
+        if isinstance(sample, dict):
+            raw_sample_id = sample.get("id", i)
+            difficulty = sample.get("difficulty", "unknown")
+            gt_from_dataset = sample.get("gt", None)
+        else:
+            raw_sample_id = i
+            difficulty = "unknown"
+            gt_from_dataset = None
+
+        # 输出目录仍然按顺序编号，保持你原来的结构不变
+        sample_dir_name = f"{i:05d}"
+        sample_dir = out_dir / "samples" / sample_dir_name
         sample_dir.mkdir(parents=True, exist_ok=True)
 
         trace_path = sample_dir / "trace_calls.jsonl"
-        trace_logger = TraceLogger(str(trace_path), mode="w")
+        trace_logger = TraceLogger(
+            str(trace_path),
+            mode="w",
+            enable_sequence_trace=not args.disable_sequence_trace,
+            enable_block_trace=not args.disable_block_trace,
+            block_size=args.logical_block_size,
+        )
 
-        # ---- extract GT for GSM8K rule scorer (per-sample) ----
+        # -----------------------------
+        # NEW: set per-sample context
+        # This will be merged into every trace.meta
+        # -----------------------------
+        trace_logger.set_sample_context(
+            {
+                "sample_id": raw_sample_id,
+                "difficulty": difficulty,
+            }
+        )
+
+        # -----------------------------
+        # NEW: write sample_info.json
+        # -----------------------------
+        sample_info = {
+            "sample_dir_id": sample_dir_name,
+            "sample_id": raw_sample_id,
+            "difficulty": difficulty,
+            "question": sample["question"] if isinstance(sample, dict) and "question" in sample else q,
+            "answer": sample.get("answer") if isinstance(sample, dict) else None,
+            "gt": gt_from_dataset,
+        }
+        with open(sample_dir / "sample_info.json", "w", encoding="utf-8") as f:
+            json.dump(sample_info, f, ensure_ascii=False, indent=2)
+
         gt_answer = None
         if isinstance(sample, dict) and "answer" in sample:
             from src.core.reward.orm_rule_gsm8k import (
@@ -141,7 +170,6 @@ def main():
             gt = extract_gsm8k_gt_from_answer_field(sample.get("answer", ""))
             gt_answer = normalize_num_str(gt) if gt is not None else None
 
-        # ---- build reward scorer per-sample ----
         if reward_mode == "none":
             reward_scorer = build_reward_scorer(
                 reward_type="none",
@@ -162,14 +190,14 @@ def main():
                     ),
                 )
             else:
-                # orm_rule_gsm8k
                 if gt_answer is None:
                     raise ValueError(
-                        f"[sample {sample_id}] GT answer not found/parsed; cannot use orm_rule_gsm8k."
+                        f"[sample_dir {sample_dir_name} / sample_id {raw_sample_id}] "
+                        f"GT answer not found/parsed; cannot use orm_rule_gsm8k."
                     )
                 reward_scorer = build_reward_scorer(
                     reward_type="orm_rule_gsm8k",
-                    reward_lm=lm,  # not used by rule scorer
+                    reward_lm=lm,
                     cfg=RewardBuildConfig(
                         reward_type="orm_rule_gsm8k",
                         gt_answer=gt_answer,
@@ -190,11 +218,9 @@ def main():
                     top_p=args.prm_step_top_p,
                 ),
             )
-
         else:
             raise ValueError(f"Unsupported reward mode: {reward_mode}")
 
-        # ---- build terminal checker per-sample ----
         terminal_checker = build_terminal_checker(
             TerminalBuildConfig(
                 terminal_mode=args.terminal_mode,
@@ -234,7 +260,8 @@ def main():
 
             workload.run(root_text, root_tokens_len, args.num_rollouts)
             print(
-                f"[OK] {sample_id} -> {sample_dir} "
+                f"[OK] sample_dir={sample_dir_name} sample_id={raw_sample_id} difficulty={difficulty} "
+                f"-> {sample_dir} "
                 f"(reward_mode={reward_mode}, orm_type={args.orm_type}, prm_type={args.prm_type}, terminal_mode={args.terminal_mode})"
             )
         finally:

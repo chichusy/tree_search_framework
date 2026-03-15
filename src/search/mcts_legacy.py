@@ -28,28 +28,23 @@ class MCTSWorkload:
         tokenizer=None,
         max_depth: int = 6,
         branch_factor: int = 2,
-        # exploration
         exploration_weight: float = 1.4,
-        weight_scheduler: str = "const",  # "exp" | "lin" | "const"
+        weight_scheduler: str = "const",
         num_rollouts: int = 100,
         discount: float = 1.0,
-        # generation
         max_new_tokens: int = 64,
         temperature: float = 0.7,
         top_p: float = 0.95,
         stop_sequences: Optional[List[str]] = None,
-        # reward
         reward_scorer: RewardScorer | None = None,
         terminal_checker: TerminalChecker | None = None,
         prm_agg: str = "mean",
-        # prompt shaping
         fixed_prompt_tokens_per_step: int = 32,
-        cache_key_mode: str = "node",  # currently only recorded in trace meta
-        # trace text dumping
+        cache_key_mode: str = "node",
         save_prompt_text: bool = False,
         save_output_text: bool = False,
-        save_prompt_max_chars: int = 0,   # 0 means no truncation; keep tail
-        save_output_max_chars: int = 0,   # 0 means no truncation; keep head
+        save_prompt_max_chars: int = 0,
+        save_output_max_chars: int = 0,
     ):
         self.lm = lm
         self.logger = trace_logger
@@ -69,31 +64,22 @@ class MCTSWorkload:
         self.stop_sequences = stop_sequences or []
         self.fixed_prompt_tokens_per_step = fixed_prompt_tokens_per_step
 
-        # tree storage
         self.nodes: Dict[int, Node] = {}
         self.next_node_id = 0
         self.parent2children: Dict[int, List[int]] = {}
 
-        # MCTS stats
         self.Q: Dict[int, float] = {}
         self.N: Dict[int, int] = {}
 
-        # explored set
         self.explored_nodes: set[int] = set()
 
-        # Reward scorer
         self.reward_scorer: RewardScorer = reward_scorer or NoneScorer()
-
-        # Terminal checker (pluggable)
         self.terminal_checker: TerminalChecker = terminal_checker or MaxDepthTerminal(self.max_depth)
-
-        # PRM aggregation (only used when reward_scorer.mode == "prm")
         self.prm_agg = (prm_agg or "mean").lower()
 
         self.root_text: Optional[str] = None
         self.cache_key_mode = cache_key_mode
 
-        # trace text dumping
         self.save_prompt_text = save_prompt_text
         self.save_output_text = save_output_text
         self.save_prompt_max_chars = save_prompt_max_chars
@@ -101,6 +87,28 @@ class MCTSWorkload:
 
     def _next_call_id(self) -> int:
         return self.logger.next_call_id
+
+    # --------------------------
+    # Token helpers
+    # --------------------------
+    def _tokenize_text(self, text: str, add_special_tokens: bool = True) -> Optional[List[int]]:
+        if self.tokenizer is None:
+            return None
+        try:
+            return list(self.tokenizer.encode(text, add_special_tokens=add_special_tokens))
+        except TypeError:
+            try:
+                return list(self.tokenizer.encode(text))
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _get_output_token_ids(self, res, out_text: str) -> Optional[List[int]]:
+        ids = getattr(res, "output_token_ids", None)
+        if ids is not None:
+            return list(ids)
+        return self._tokenize_text(out_text, add_special_tokens=False)
 
     # --------------------------
     # Node utils
@@ -118,7 +126,11 @@ class MCTSWorkload:
         return nid
 
     def init_root(self, root_text: str, root_tokens_len: int) -> int:
-        return self._new_node(None, 0, root_text, root_tokens_len)
+        root_id = self._new_node(None, 0, root_text, root_tokens_len)
+        root_ids = self._tokenize_text(root_text, add_special_tokens=True)
+        if root_ids is not None:
+            self.logger.register_node_sequence(root_id, root_ids)
+        return root_id
 
     def _terminal_decision(self, nid: int) -> TerminalDecision:
         node = self.nodes[nid]
@@ -164,30 +176,21 @@ class MCTSWorkload:
         parent = self.nodes[parent_id]
         prompt_text = parent.prefix_text
 
-        # Tokenize prompt
-        input_ids = None
-        if self.tokenizer is not None:
-            try:
-                input_ids = self.tokenizer.encode(prompt_text)
-                prompt_tokens_len = len(input_ids)
-            except Exception:
-                input_ids = None
-                prompt_tokens_len = 0
+        prompt_token_ids = self._tokenize_text(prompt_text, add_special_tokens=True)
+
+        if prompt_token_ids is not None:
+            prompt_tokens_len = len(prompt_token_ids)
         else:
-            # fallback only for dummy / no-tokenizer mode
             prompt_tokens_len = parent.prefix_tokens_len + self.fixed_prompt_tokens_per_step
 
-        # locality stats
         loc = self.logger.compute_locality(
             node_id=parent_id,
             parent_node_id=parent.parent_id,
-            input_ids=input_ids,
+            input_ids=prompt_token_ids,
             remember_for_node=True,
         )
 
-        # LLM generate
         t0 = int(time.time() * 1000)
-
         try:
             res = self.lm.generate(
                 prompt_text,
@@ -203,13 +206,16 @@ class MCTSWorkload:
                 temperature=self.temperature,
                 top_p=self.top_p,
             )
-
         t1 = int(time.time() * 1000)
 
         out_text = getattr(res, "output_text", "") or ""
-        out_tokens_len = int(getattr(res, "output_tokens_len", 0) or 0)
+        output_token_ids = self._get_output_token_ids(res, out_text)
+        out_tokens_len = (
+            len(output_token_ids)
+            if output_token_ids is not None
+            else int(getattr(res, "output_tokens_len", 0) or 0)
+        )
 
-        # Optional dump prompt/output text
         prompt_text_saved = None
         output_text_saved = None
 
@@ -220,7 +226,7 @@ class MCTSWorkload:
                 and self.save_prompt_max_chars > 0
                 and len(prompt_text_saved) > self.save_prompt_max_chars
             ):
-                prompt_text_saved = prompt_text_saved[-self.save_prompt_max_chars:]  # keep tail
+                prompt_text_saved = prompt_text_saved[-self.save_prompt_max_chars:]
 
         if self.save_output_text:
             output_text_saved = out_text
@@ -230,18 +236,13 @@ class MCTSWorkload:
                 and self.save_output_max_chars > 0
                 and len(output_text_saved) > self.save_output_max_chars
             ):
-                output_text_saved = output_text_saved[:self.save_output_max_chars]  # keep head
+                output_text_saved = output_text_saved[:self.save_output_max_chars]
 
-        # Create child node
         child_prefix_text = prompt_text + "\n" + out_text
+        full_token_ids = self._tokenize_text(child_prefix_text, add_special_tokens=True)
 
-        # Create child node (token length)
-        if self.tokenizer is not None:
-            try:
-                child_input_ids = self.tokenizer.encode(child_prefix_text)
-                child_prefix_tokens_len = len(child_input_ids)
-            except Exception:
-                child_prefix_tokens_len = prompt_tokens_len + out_tokens_len
+        if full_token_ids is not None:
+            child_prefix_tokens_len = len(full_token_ids)
         else:
             child_prefix_tokens_len = prompt_tokens_len + out_tokens_len
 
@@ -255,9 +256,19 @@ class MCTSWorkload:
         self.parent2children.setdefault(parent_id, []).append(child_id)
         parent.children.append(child_id)
 
-        # Trace record
-        rec = CallRecord(
-            call_id=self._next_call_id(),
+        meta = {
+            "created_child_id": child_id,
+            "depth": parent.depth,
+            "phase": phase,
+            "cache_key_mode": self.cache_key_mode,
+            "vllm_num_cached_tokens": int(getattr(res, "num_cached_tokens", 0) or 0),
+            "stop_sequences": self.stop_sequences if self.stop_sequences else None,
+        }
+
+        call_id = self._next_call_id()
+
+        call_rec = CallRecord(
+            call_id=call_id,
             rollout_id=rollout_id,
             node_id=parent_id,
             parent_node_id=parent.parent_id,
@@ -273,19 +284,29 @@ class MCTSWorkload:
             miss_parent=loc["miss_parent"],
             t_start_ms=t0,
             t_end_ms=t1,
-            meta={
-                "created_child_id": child_id,
-                "depth": parent.depth,
-                "phase": phase,
-                "cache_key_mode": self.cache_key_mode,
-                "vllm_num_cached_tokens": int(getattr(res, "num_cached_tokens", 0) or 0),
-                "stop_sequences": self.stop_sequences if self.stop_sequences else None,
-            },
+            meta=meta,
             prompt_text=prompt_text_saved,
             output_text=output_text_saved,
         )
 
-        self.logger.log_call(rec)
+        seq_rec = self.logger.build_sequence_record(
+            call_id=call_id,
+            rollout_id=rollout_id,
+            node_id=parent_id,
+            parent_node_id=parent.parent_id,
+            purpose=phase,
+            prompt_token_ids=prompt_token_ids,
+            output_token_ids=output_token_ids,
+            full_token_ids=full_token_ids,
+            meta=meta,
+        )
+
+        block_rec = self.logger.build_block_record(seq_rec)
+
+        if full_token_ids is not None:
+            self.logger.register_node_sequence(child_id, full_token_ids)
+
+        self.logger.log_generation_bundle(call_rec, seq_rec, block_rec)
         return child_id
 
     def _log_event(self, rollout_id: int, node_id: int, purpose: str, meta: dict):
@@ -304,16 +325,6 @@ class MCTSWorkload:
     # Reward
     # --------------------------
     def _aggregate_prm_scores(self, scores: List[float]) -> float:
-        """
-        Aggregate step-wise PRM scores in [0,1] into a scalar rollout reward.
-
-        Supported:
-          - mean: average
-          - min:  minimum
-          - prod: product
-          - last: last score
-          - terminal: only terminal score (same as last if you append terminal at end)
-        """
         if not scores:
             return 0.0
 
@@ -345,11 +356,9 @@ class MCTSWorkload:
         term_info = td.info
 
         if mode == "prm":
-            # True PRM path scoring: step-wise + terminal
             step_rewards: List[float] = []
             step_raw_scores: List[float] = []
 
-            # steps: full_path[1:-1] (exclude root, exclude leaf)
             for step_idx, nid in enumerate(full_path[1:-1], start=1):
                 partial_text = self.nodes[nid].prefix_text
                 step_res = self.reward_scorer.score_step(self.root_text, partial_text, step_idx)
@@ -359,7 +368,6 @@ class MCTSWorkload:
 
             terminal_res = self.reward_scorer.score_terminal(self.root_text, leaf_text)
 
-            # append terminal score as last element
             all_scores = list(step_rewards) + [float(terminal_res.reward)]
             agg_reward = self._aggregate_prm_scores(all_scores)
 
@@ -381,7 +389,6 @@ class MCTSWorkload:
                 },
             )
         else:
-            # none / orm
             result = self.reward_scorer.score_terminal(self.root_text, leaf_text)
 
         self._log_event(
